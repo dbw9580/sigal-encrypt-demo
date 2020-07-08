@@ -23,51 +23,210 @@
 "use strict"
 class Decryptor {
     constructor(config) {
-        const c = Decryptor._getCrypto();
-        if (Decryptor.isWorker()) {
-            this._role = "worker";
-            const encoder = new TextEncoder("utf-8");
-            const salt = encoder.encode(config.kdf_salt);
-            const iters = config.kdf_iters;
-            const shared_key = encoder.encode(config.password);
-            const gcm_tag = encoder.encode(config.gcm_tag);
+        this._jobCount = 0;
+        this._jobMap = new Map();
+        this._workerReady = false;
 
-            Decryptor
-            ._initAesKey(c, salt, iters, shared_key)
-            .then((aes_key) => {
-                this._decrypt = (encrypted_blob_arraybuffer) => 
-                    Decryptor.decrypt(c, encrypted_blob_arraybuffer,
-                        aes_key, gcm_tag);
-            })
-            .then(() => {
-                Decryptor._sendEvent(self, "DecryptWorkerReady");
-            });
-        } else {
+        if (Decryptor.isServiceWorker()) {
+            this._role = "service_worker";
+        } else if (!Decryptor.isWorker()) {
             this._role = "main";
-            this._jobCount = 0;
-            this._numWorkers = Math.min(4, navigator.hardwareConcurrency);
-            this._jobMap = new Map();
-            this._workerReady = false;
-            this._galleryId = config.galleryId;
-            Decryptor._initPage();
-            if (!("password" in config && config.password)) {
-                this._askPassword()
-                .then((password) => {
-                    config.password = password;
-                    this._createWorkerPool(config);
-                })
-            } else {
-                this._createWorkerPool(config);
-            }
+            this._config = config;
+            document.addEventListener(
+                "DOMContentLoaded",
+                (e) => {
+                    if (!Decryptor.featureTest()) {
+                        Decryptor.mSetUIVisibility("main-prompt", true);
+                        Decryptor.mSetUIVisibility("missing-feature", true);
+                        return;
+                    }
+                    const local_config = this._mGetLocalConfig();
+                    if (local_config) {
+                        this._config = local_config;
+                    }
+                    this._mSetupServiceWorker();
+                },
+                { once: true, passive: true }
+            );
         }
 
         console.info("Decryptor initialized");
     }
 
-    /* main thread only */
     static init(config) {
-        if (Decryptor.isWorker()) return;
-        window.decryptor = new Decryptor(config);
+        self.decryptor = new Decryptor(config);
+    }
+
+    static featureTest() {
+        let features = [
+            typeof crypto,
+            typeof TextEncoder,
+            typeof navigator.serviceWorker,
+            typeof Proxy,
+            typeof fetch,
+            typeof Blob.prototype.arrayBuffer,
+            typeof Response.prototype.clone,
+            typeof caches
+        ];
+        return features.every((e) => e !== "undefined");
+    }
+
+    async _swInitServiceWorker(config) {
+        const crypto = Decryptor._getCrypto();
+        const encoder = new TextEncoder("utf-8");
+        const salt = encoder.encode(config.kdf_salt);
+        const iters = config.kdf_iters;
+        const shared_key = encoder.encode(config.password);
+        const gcm_tag = encoder.encode(config.gcm_tag);
+
+        const aes_key = await Decryptor._initAesKey(crypto, salt, iters, shared_key);
+        if (await this._swCheckAesKey(aes_key, gcm_tag)) {
+            this.workerReady = true;
+            this._decrypt = (encrypted_blob_arraybuffer) => 
+                Decryptor.decrypt(crypto, encrypted_blob_arraybuffer, aes_key, gcm_tag);
+            this._swNotifyWorkerReady();
+        } else {
+            this.workerReady = false;
+            this._swNotifyIncorrectPassword()
+        }
+    }
+
+    async _swCheckAesKey(aes_key, gcm_tag) {
+        let response;
+        try {
+            response = await fetch(Decryptor.keyCheckURL);
+        } catch (error) {
+            throw new Error("Fetched failed when checking encryption key");
+        }
+        try {
+            await Decryptor.decrypt(
+                Decryptor._getCrypto(),
+                await response.blob(),
+                aes_key,
+                gcm_tag,
+                true
+            );
+        } catch (error) {
+            console.warn("Password is incorrect!");
+            return false;
+        }
+        return true;
+    }
+
+    async _swNotifyWorkerReady() {
+        const array_clients = await self.clients.matchAll({includeUncontrolled: true});
+        for (let client of array_clients) {
+            this._proxyWrap(client)._mSetWorkerReady();
+        }
+    }
+
+    async _swNotifyIncorrectPassword() {
+        const array_clients = await self.clients.matchAll({includeUncontrolled: true});
+        for (let client of array_clients) {
+            this._proxyWrap(client)._mUnsetWorkerReady();
+        }
+    }
+
+    static isInitialized() {
+        return 'decryptor' in self;
+    }
+
+    static isWorkerReady() {
+        return Decryptor.isInitialized() && self.decryptor._workerReady;
+    }
+
+    get workerReady() {
+        return this._workerReady;
+    }
+
+    set workerReady(val) {
+        this._workerReady = (val ? true : false);
+    }
+
+    _mSetWorkerReady() {
+        this.workerReady = true;
+        Decryptor.mSetUIVisibility("main-prompt", false);
+        Decryptor.mSetUIVisibility("password-prompt", false);
+        Decryptor.mSetUIVisibility("incorrect-password", false);
+        const firstVisit = this._mGetLocalConfig() === null;
+        if (firstVisit) {
+            localStorage.setItem(this._config.galleryId, JSON.stringify(this._config));
+            window.location.reload();
+        }
+    }
+
+    _mUnsetWorkerReady() {
+        this.workerReady = false;
+        localStorage.removeItem(this._config.galleryId);
+        Decryptor.mSetUIVisibility("main-prompt", true);
+        Decryptor.mSetUIVisibility("password-prompt", true);
+        Decryptor.mSetUIVisibility("incorrect-password", true);
+        Decryptor.mPlayUIAnimation("incorrect-password");
+    }
+
+    _mGetLocalConfig() {
+        try {
+            const local_config = JSON.parse(localStorage.getItem(this._config.galleryId));
+            if (local_config 
+                && local_config.galleryId
+                && local_config.sw_script
+                && local_config.password
+                && local_config.gcm_tag
+                && local_config.kdf_salt
+                && local_config.kdf_iters) {
+                return local_config;
+            }
+        } catch (e) {
+            console.error("Error retrieving config from local storage: " + e);
+        } 
+        return null;
+    }
+
+    async _mSetupServiceWorker() {
+        if (!('serviceWorker' in navigator)) {
+            console.error("Fatal: Your browser does not support service worker");
+            throw new Error("no service worker support");
+        }
+
+        if (navigator.serviceWorker.controller) {
+            this.serviceWorker = navigator.serviceWorker.controller;
+        } else {
+            navigator.serviceWorker.register(this._config.sw_script);
+            const registration = await navigator.serviceWorker.ready;
+            this.serviceWorker = registration.active;
+        }
+
+        navigator.serviceWorker.onmessage = 
+            (e) => Decryptor.onMessage(this.serviceWorker, e);
+        this.serviceWorker = this._proxyWrap(this.serviceWorker);
+
+        if (!(await this.serviceWorker.Decryptor.isWorkerReady())) {
+            if ('password' in this._config && this._config.password) {
+                this.serviceWorker._swInitServiceWorker(this._config);
+            } else {
+                Decryptor.mSetUIVisibility("main-prompt", true);
+                Decryptor.mSetUIVisibility("password-prompt", true);
+                document.addEventListener(
+                    "DecryptorPasswordProvided",
+                    (e) => {
+                        const password = e.detail;
+                        if (password) {
+                            this._config.password = password;
+                            this.serviceWorker._swInitServiceWorker(this._config);
+                        }
+                    },
+                    { passive: true }
+                );
+            }
+        } else {
+            this.workerReady = true;
+            Decryptor.mSetUIVisibility("main-prompt", false);
+            Decryptor.mSetUIVisibility("password-prompt", false);
+        }
+    }
+
+    static isServiceWorker() {
+        return ('undefined' !== typeof ServiceWorkerGlobalScope) && ("function" === typeof importScripts) && (navigator instanceof WorkerNavigator);
     }
 
     static isWorker() {
@@ -75,34 +234,50 @@ class Decryptor {
     }
 
     static _getCrypto() {
-        if(crypto && crypto.subtle) {
+        if('undefined' !== typeof crypto && crypto.subtle) {
             return crypto.subtle;
         } else {
             throw new Error("Fatal: Browser does not support Web Crypto");
         }
     }
 
-    /* main thread only */
-    async _askPassword() {
-        let password = sessionStorage.getItem(this._galleryId);
-        if (!password) {
-            return new Promise((s, e) => {
-                window.addEventListener(
-                    "load",
-                    s,
-                    { once: true, passive: true }
-                );
-            }).then((e) => {
-                const password = prompt("Input password to view this gallery:");
-                if (password) {
-                    sessionStorage.setItem(this._galleryId, password);
-                    return password;
-                } else {
-                    return "__wrong_password__";
-                }
-            });
+    static async setPassword(password) {
+        Decryptor._sendEvent(document, "DecryptorPasswordProvided", password);
+    }
+
+    static mSetUIVisibility(UIElement, visible) {
+        let element;
+        switch (UIElement) {
+            case "password-prompt":
+                element = "decrypt-password-prompt";
+                break;
+            case "incorrect-password":
+                element = "indicator-text-incorrect-password";
+                break;
+            case "missing-feature":
+                element = "decrypt-missing-feature";
+                break;
+            case "main-prompt":
+                element = "decrypt-main-prompt";
+                break;
+            default:
+                return;
+        }
+        if (visible) {
+            document.getElementById(element).classList.remove("hidden");
         } else {
-            return password;
+            document.getElementById(element).classList.add("hidden");
+        }
+    }
+
+    static mPlayUIAnimation(UIElement) {
+        switch (UIElement) {
+            case "incorrect-password":
+                const element = document.getElementById("indicator-text-incorrect-password").parentElement;
+                element.classList.add("shake-animated");
+                break;
+            default:
+                return;
         }
     }
 
@@ -129,78 +304,6 @@ class Decryptor {
         );
     }
 
-    async _doReload(url, img) {
-        const proceed = Decryptor._sendEvent(img, "DecryptImageBeforeLoad", {oldSrc: url});
-        if (proceed) {
-            let old_src = url;
-            try {
-                const blobUrl = await this.dispatchJob("reloadImage", [old_src, null]);
-                img.addEventListener(
-                    "load", 
-                    (e) => Decryptor._sendEvent(e.target, "DecryptImageLoaded", {oldSrc: old_src}),
-                    {once: true, passive: true}
-                );
-                img.src = blobUrl;
-            } catch (error) {
-                img.addEventListener(
-                    "load", 
-                    (e) => Decryptor._sendEvent(e.target, "DecryptImageError", {oldSrc: old_src, error: error}),
-                    {once: true, passive: true}
-                );
-                img.src = Decryptor.imagePlaceholderURL;
-                // password is incorrect
-                if (error.message.indexOf("decryption failed") >= 0) {
-                    sessionStorage.removeItem(this._galleryId);
-                }
-                throw new Error(`Image reload failed: ${error.message}`);
-            }
-        }
-    }
-    
-    async reloadImage(url, img) {
-        if (this._role === "main") {
-            const full_url = (new URL(url, window.location)).toString();
-            if (!this.isWorkerReady()) {
-                document.addEventListener(
-                    "DecryptWorkerReady",
-                    (e) => { this._doReload(full_url, img); },
-                    {once: true, passive: true}
-                );
-            } else {
-                this._doReload(full_url, img);
-            }
-        } else if (this._role === "worker") {
-            let r;
-            try {
-                r = await fetch(url);
-            } catch (e) {
-                throw new Error("fetch failed");
-            }
-            if (r && r.ok) {
-                const encrypted_blob = await r.blob();
-                try {
-                    const decrypted_blob = await this._decrypt(encrypted_blob);
-                    return URL.createObjectURL(decrypted_blob);
-                } catch (e) {
-                    throw new Error(`decryption failed: ${e.message}`);
-                }
-            } else {
-                throw new Error("fetch failed");
-            }
-        }
-    }
-
-    /* main thread only */
-    static onNewImageError(e) {
-        if (e.target.src.startsWith("blob")) return;
-        if (!window.decryptor) return;
-
-        window.decryptor.reloadImage(e.target.src, e.target);
-        e.preventDefault();
-        e.stopPropagation();
-        e.stopImmediatePropagation();
-    }
-
     static _sendEvent(target, type, detail = null) {
         const eventInit = {
             detail: detail,
@@ -210,186 +313,342 @@ class Decryptor {
         return target.dispatchEvent(new CustomEvent(type, eventInit));
     }
 
-    /* main thread only */
-    static _initPage() {
-        document.addEventListener(
-            "error",
-            e => {
-                if (e.target instanceof HTMLImageElement) {
-                    Decryptor.onNewImageError(e);
-                }
-            },
-            {capture: true}
+    static async checkMagicString(arraybuffer) {
+        const sample = new DataView(
+            arraybuffer, 
+            0, 
+            Decryptor.MAGIC_STRING_ARRAYBUFFER.byteLength
         );
-
-        Image = (function (oldImage) {
-            function Image(...args) {
-                let img = new oldImage(...args);
-                img.addEventListener(
-                    "error",
-                    Decryptor.onNewImageError
-                );
-                return img;
+        for (let i = 0; i < Decryptor.MAGIC_STRING_ARRAYBUFFER.byteLength; i++) {
+            if (Decryptor.MAGIC_STRING_ARRAYBUFFER[i] !== sample.getUint8(i)) {
+                return false;
             }
-            Image.prototype = oldImage.prototype;
-            Image.prototype.constructor = Image;
-            return Image;
-        })(Image);
-
-        document.createElement = (function(create) {
-            return function() {
-                let ret = create.apply(this, arguments);
-                if (ret.tagName.toLowerCase() === "img") {
-                    ret.addEventListener(
-                        "error",
-                        Decryptor.onNewImageError
-                    );
-                }
-                return ret;
-            };
-        })(document.createElement);
+        }
+        return true;
     }
 
-    static async decrypt(crypto, blob, aes_key, gcm_tag) {
-        const iv = await blob.slice(0, 12).arrayBuffer();
-        const ciphertext = await blob.slice(12).arrayBuffer();
-        const decrypted = await crypto.decrypt(
-                {
-                    name: "AES-GCM",
-                    iv: iv,
-                    additionalData: gcm_tag
-                },
-                aes_key,
-                ciphertext
-            );
-        return new Blob([decrypted], {type: blob.type});
-    }
+    static async decrypt(crypto, blob_or_arraybuffer, aes_key, gcm_tag, check_magic_string=false) {
+        let arraybuffer, return_blob;
+        if (blob_or_arraybuffer instanceof Blob) {
+            arraybuffer = await blob_or_arraybuffer.arrayBuffer();
+            return_blob = true;
+        } else if (blob_or_arraybuffer instanceof ArrayBuffer) {
+            arraybuffer = blob_or_arraybuffer
+            return_blob = false;
+        } else {
+            throw new TypeError("decrypt accepts either a Blob or an ArrayBuffer");
+        }
 
-    isWorkerReady() {
-        return this._workerReady;
-    }
+        // make sure there is enough data to decrypt
+        // although 1 byte of data seems not acceptable for some browsers
+        // in which case crypto.decrypt will throw an error
+        // "The provided data is too small"
+        if (arraybuffer.byteLength < 
+            Decryptor.MAGIC_STRING_ARRAYBUFFER.byteLength
+            + Decryptor.IV_LENGTH
+            + 1) {
+            throw new Error("not enough data to decrypt");
+        }
 
-    _createWorkerPool(config) {
-        if (this._role !== "main") return;
-        if (this._workerReady) return;
-
-        let callback = (e) => {
-            const callbacks = this._jobMap.get(e.data.id);
-            if (e.data.success) {
-                if (callbacks.success) callbacks.success(e.data.result);
-            } else {
-                if (callbacks.error) callbacks.error(new Error(e.data.result));
-            }
-            this._jobMap.delete(e.data.id);
-        };
-
-        let pool = Array();
+        if (check_magic_string && !(await Decryptor.checkMagicString(arraybuffer))) {
+            // data is not encrypted
+            return blob_or_arraybuffer;
+        }
         
-        for (let i = 0; i < this._numWorkers; i++) {
-            let worker = new Worker(config.worker_script);
-            worker.onmessage = callback;
-            pool.push(worker);
-        }
-        this._workerPool = pool;
-
-        let notReadyWorkers = this._numWorkers;
-        for (let i = 0; i < this._numWorkers; i++) {
-            this.dispatchJob("new", [config])
-            .then(() => { 
-                if (--notReadyWorkers <= 0) {
-                    this._workerReady = true;
-                    Decryptor._sendEvent(document, "DecryptWorkerReady");
-                }
-            });
+        const iv = new DataView(
+            arraybuffer, 
+            Decryptor.MAGIC_STRING_ARRAYBUFFER.byteLength, 
+            Decryptor.IV_LENGTH
+        );
+        const ciphertext = new DataView(
+            arraybuffer, 
+            Decryptor.MAGIC_STRING_ARRAYBUFFER.byteLength + Decryptor.IV_LENGTH
+        );
+        const decrypted = await crypto.decrypt(
+            {
+                name: "AES-GCM",
+                iv: iv,
+                additionalData: gcm_tag
+            },
+            aes_key,
+            ciphertext
+        );
+        if (return_blob) {
+            return new Blob([decrypted], {type: blob_or_arraybuffer.type});
+        } else {
+            return decrypted;
         }
     }
 
-    /*
-     * method: string
-     * args: Array
-     */
-    dispatchJob(method, args) {
-        if (this._role === "main") {
-            return new Promise((success, error) => {
-                const jobId = this._jobCount++;
-                const worker = this._workerPool[jobId % this._numWorkers];
-                this._jobMap.set(jobId, {success: success, error: error});
-                Decryptor._postJobToWorker(jobId, worker, method, args);
-            });
-        } else if (this._role === "worker") {
-            return Decryptor._asyncReturn(this, method, args)
-            .then(
-                (result) => { return {success: true, result: result}; }, 
-                (error) => { return {success: false, result: error.message}; }
-            );
+    _proxyWrap(target) {
+        const decryptor = this;
+        const handler = {
+            get: (wrappedObj, prop) => {
+                if (prop in wrappedObj) {
+                    if (wrappedObj[prop] instanceof Function) {
+                        return (...args) => wrappedObj[prop].apply(wrappedObj, args);
+                    } else {
+                        return wrappedObj[prop];
+                    }
+                }
+                if (prop === "Decryptor") {
+                    return new Proxy(target, {
+                        get: (wrappedObj, prop) => {
+                            return decryptor._rpcCall(wrappedObj, prop, true);
+                        }
+                    });
+                }
+                return decryptor._rpcCall(wrappedObj, prop, false);
+            }
         }
+        return new Proxy(target, handler);
+    }
+
+    _rpcCall(target, method, static_) {
+        const decryptor = this;
+        const dummyFunction = () => {};
+        const handler = {
+            apply: (wrappedFunc, thisArg, args) => {
+                return new Promise((success, error) => {
+                    const jobId = decryptor._jobCount++;
+                    decryptor._jobMap.set(jobId, {success: success, error: error});
+                    Decryptor._rpcPostJob(jobId, target, method, args, static_);
+                });
+            }
+        };
+        return new Proxy(dummyFunction, handler);
+    }
+
+    static _rpcPostJob(jobId, messagePort, method, args, static_=false) {
+        const job = {
+            type: "job",
+            id: jobId,
+            method: method,
+            args: args,
+            static: static_
+        };
+        messagePort.postMessage(job);
     }
 
     static _asyncReturn(instance, method, args) {
-        if (method in instance && instance[method] instanceof Function) {
-            try {
-                let promise_or_value = instance[method].apply(instance, args);
-                if (promise_or_value instanceof Promise) {
-                    return promise_or_value;
-                } else {
-                    return Promise.resolve(promise_or_value);
-                }
-            } catch (e) {
-                return Promise.reject(e);
-            }
-        } else {
+        if (!(instance instanceof Object)) {
+            return Promise.reject(new Error("calling method on a primitive"));
+        }
+        if (!(method in instance && instance[method] instanceof Function)) {
             return Promise.reject(new Error(`no such method: ${method}`))
         }
+        
+        try {
+            let promise_or_value = instance[method].apply(instance, args);
+            if (promise_or_value instanceof Promise) {
+                return promise_or_value;
+            } else {
+                return Promise.resolve(promise_or_value);
+            }
+        } catch (e) {
+            return Promise.reject(e);
+        }
     }
 
-    static _postJobToWorker(jobId, worker, method, args) {
-        const job = {
-            id: jobId,
-            method: method,
-            args: args
-        };
-        worker.postMessage(job);
-    }
-
-    /* worker thread only */
-    static onWorkerMessage(e) {
+    static onMessage(replyPort, e) {
+        const type = e.data.type;
         const id = e.data.id;
-        const method = e.data.method;
-        const args = e.data.args;
 
-        if (method === "new") {
-            self.decryptor = new Decryptor(...args);
-            self.addEventListener(
-                "DecryptWorkerReady",
-                (e) => self.postMessage({id: id, success: true, result: "worker ready"}),
-                {once: true, passive: true}
-            );
-        } else {
-            self.decryptor
-            .dispatchJob(method, args)
+        if (type === "job") {
+            const method = e.data.method;
+            const args = e.data.args;
+            const instance = e.data.static ? Decryptor :
+                (Decryptor.isWorker() ? self : window).decryptor;
+
+                Decryptor._asyncReturn(instance, method, args)
+            .then(
+                (result) => { return {type: "reply", success: true, result: result}; }, 
+                (error) => { return {type: "reply", success: false, result: error.message}; }
+            )
             .then((reply) => {
                 reply.id = id;
-                self.postMessage(reply);
+                replyPort.postMessage(reply);
             });
+        } else if (type === "reply") {
+            // if we are receiving replies, we must have been initialized
+            // so no need to check if "decryptor" exists here
+            const success = e.data.success;
+            const result = e.data.result;
+            const callbacks = decryptor._jobMap.get(id);
+
+            if (success) {
+                if (callbacks.success) callbacks.success(result);
+            } else {
+                if (callbacks.error) callbacks.error(new Error(result));
+            }
+            decryptor._jobMap.delete(id);
         }
+    }
+
+    static onServiceWorkerInstall(e) {
+        console.log("service worker on install: ", e);
+        e.waitUntil(self.skipWaiting());
+    }
+
+    static onServiceWorkerActivate(e) {
+        console.log("service worker on activate: ", e);
+        e.waitUntil(self.clients.claim());
+    }
+
+    static onServiceWorkerMesssage(e) {
+        return Decryptor.onMessage(e.source, e);
+    }
+
+    static async _addToCache(request, response) {
+        const cache = await caches.open("v1");
+        await cache.put(request, response);
+    }
+
+    static async _swHandleFetch(e) {
+        const request = e.request;
+        try {
+            const cached_response = await caches.match(request);
+            if (cached_response) {
+                // TODO: handle cache expiration
+                console.debug(`Found cached response for ${request.url}`);
+                return cached_response;
+            }
+        } catch (error) {
+            console.error("Caches.match error!");
+        }
+
+        let response;
+        try {
+            response = await fetch(request);
+        } catch (error) {
+            console.debug(`Fetch failed when trying for ${request.url}: ${error}`);
+            return Decryptor.generalErrorResponse.clone();
+        }
+
+        if (!response.ok) {
+            console.debug(`Fetch succeeded but server returned non-2xx: ${request.url}`);
+            return response;
+        }
+
+        const is_image = [
+            request.destination === "image",
+            (() => {
+                const content_type = response.headers.get("content-type");
+                return content_type && content_type.startsWith("image");
+            })()
+        ];
+
+        if (!is_image.some((e) => e)) {
+            console.debug(`Fetch succeeded but response is likely not an image ${request.url}`);
+            return response;
+        }
+
+        const response_clone = response.clone();
+        const encrypted_blob = await response.blob();
+        const encrypted_arraybuffer = await encrypted_blob.arrayBuffer();
+        if (!(await Decryptor.checkMagicString(encrypted_arraybuffer))) {
+            console.debug(`Response image is not encrypted: ${request.url}`);
+            return response_clone;
+        }
+        console.debug(`Fetch succeeded with encrypted image ${request.url}, trying to decrypt`);
+
+        if (!Decryptor.isWorkerReady()) {
+            if (Decryptor.isInitialized()) {
+                try{
+                    const client = await self.clients.get(e.clientId);
+                    const config = await self.decryptor._proxyWrap(client)._mGetLocalConfig();
+                    await self.decryptor._swInitServiceWorker(config);
+                } catch (error) {
+                    // do nothing
+                }
+            }
+            if (!Decryptor.isWorkerReady()) {
+                console.debug(`Decryptor not initialized on fetch event`);
+                return Decryptor.imageErrorResponse.clone();
+            }
+        }
+
+        let decrypted_blob;
+        try {
+            decrypted_blob = new Blob(
+                [await self.decryptor._decrypt(encrypted_arraybuffer)],
+                {type: encrypted_blob.type}
+            );
+        } catch (error) {
+            console.debug(`Decryption failed for ${request.url}: ${error.message}`);
+            console.error("Corrupted data??? This shouldn't occur.");
+            return Decryptor.imageErrorResponse.clone();
+        }
+
+        const decrypted_response = new Response(
+            decrypted_blob,
+            {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            }
+        );
+        decrypted_response.headers.set("content-length", decrypted_blob.size);
+        
+        Decryptor._addToCache(request, decrypted_response.clone());
+
+        console.debug(`Responding with decrypted response ${request.url}`);
+        return decrypted_response;
+    }
+
+    static onServiceWorkerFetch(e) {
+        e.respondWith(Decryptor._swHandleFetch(e));
     }
 }
 
-Decryptor.imagePlaceholderURL = URL.createObjectURL(new Blob([
+Decryptor.MAGIC_STRING = "_e_n_c_r_y_p_t_e_d_";
+Decryptor.MAGIC_STRING_ARRAYBUFFER = (new TextEncoder("utf-8")).encode(Decryptor.MAGIC_STRING);
+Decryptor.IV_LENGTH = 12;
+Decryptor.keyCheckURL = "static/keycheck.txt";
+Decryptor.imagePlaceholderBlob = new Blob([
 `<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
 <!-- Created with Method Draw - http://github.com/duopixel/Method-Draw/ -->
 <g>
- <title>background</title>
- <rect fill="#ffffff" id="canvas_background" height="202" width="202" y="-1" x="-1"/>
- <g display="none" overflow="visible" y="0" x="0" height="100%" width="100%" id="canvasGrid">
-  <rect fill="url(#gridpattern)" stroke-width="0" y="0" x="0" height="100%" width="100%"/>
- </g>
+    <title>background</title>
+    <rect fill="#ffffff" id="canvas_background" height="202" width="202" y="-1" x="-1"/>
+    <g display="none" overflow="visible" y="0" x="0" height="100%" width="100%" id="canvasGrid">
+    <rect fill="url(#gridpattern)" stroke-width="0" y="0" x="0" height="100%" width="100%"/>
+    </g>
 </g>
 <g>
- <title>Layer 1</title>
- <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_1" y="61.949997" x="22.958336" stroke-width="0" stroke="#000" fill="#7f7f7f">Could not</text>
- <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_4" y="112.600002" x="65.974998" stroke-width="0" stroke="#000" fill="#7f7f7f">load</text>
- <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_5" y="162.949997" x="50.983334" stroke-width="0" stroke="#000" fill="#7f7f7f">image</text>
+    <title>Layer 1</title>
+    <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_1" y="61.949997" x="22.958336" stroke-width="0" stroke="#000" fill="#7f7f7f">Could not</text>
+    <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_4" y="112.600002" x="65.974998" stroke-width="0" stroke="#000" fill="#7f7f7f">load</text>
+    <text xml:space="preserve" text-anchor="start" font-family="Helvetica, Arial, sans-serif" font-size="36" id="svg_5" y="162.949997" x="50.983334" stroke-width="0" stroke="#000" fill="#7f7f7f">image</text>
 </g>
-</svg>`], {type: "image/svg+xml"}));
+</svg>`], {type: "image/svg+xml"});
 
+Decryptor.imageErrorResponse = new Response(
+    Decryptor.imagePlaceholderBlob,
+    {
+        status: 200,
+        statusText: "OK",
+        headers: {
+            "content-type": "image/svg+xml"
+        }
+    }
+);
+
+Decryptor.generalErrorResponse = new Response(
+    null,
+    {
+        status: 500,
+        statusText: "Server Error"
+    }
+);
+
+Promise.timeout = function(cb_or_pm, timeout) {
+    return Promise.race([
+        cb_or_pm instanceof Function ? new Promise(cb_or_pm) : cb_or_pm,
+        new Promise((resolve, reject) => {
+            setTimeout(() => {
+                reject('Timed out');
+            }, timeout);
+        })
+    ]);
+}
